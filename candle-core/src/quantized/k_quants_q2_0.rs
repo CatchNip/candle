@@ -348,6 +348,57 @@ mod tests {
         Ok(())
     }
 
+    /// Throughput of the ternary matmul vs a dense f32 matmul at a BitNet-2B
+    /// projection size (single-token decode). Run in release:
+    /// `cargo test -p candle-core --release q2_0_matmul_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark; run in release"]
+    fn q2_0_matmul_throughput() -> crate::Result<()> {
+        use crate::{Device, Tensor};
+        use std::time::Instant;
+
+        let dev = Device::Cpu;
+        let (out, k, m) = (2560usize, 2560usize, 1usize);
+        let w: Vec<f32> = (0..out * k)
+            .map(|e| (((e * 7 + 1) % 3) as i32 - 1) as f32 * 0.1)
+            .collect();
+        let x: Vec<f32> = (0..m * k).map(|e| ((e as f32) * 0.01).sin()).collect();
+        let iters = 50;
+
+        // Dense f32 path (the lower bound of what the dense BitNet path costs —
+        // it additionally unpacks ternary to f32 every forward).
+        let w_t = Tensor::from_vec(w.clone(), (out, k), &dev)?;
+        let x_t = Tensor::from_vec(x.clone(), (m, k), &dev)?;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = x_t.matmul(&w_t.t()?)?;
+        }
+        let dense_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // Quantized Q2_0 path.
+        let kb = k / QK2_0;
+        let mut rhs_t = vec![BlockQ2_0::zeros(); out * kb];
+        for c in 0..out {
+            for blk in 0..kb {
+                let mut chunk = [0f32; QK2_0];
+                chunk.copy_from_slice(&w[c * k + blk * QK2_0..c * k + (blk + 1) * QK2_0]);
+                rhs_t[c * kb + blk] = quantize_block_q2_0(&chunk);
+            }
+        }
+        let mut dst = vec![0f32; m * out];
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            matmul_q2_0((m, k, out), &x, &rhs_t, &mut dst)?;
+        }
+        let q_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        eprintln!(
+            "[q2_0 matmul {out}x{k}] dense f32: {dense_ms:.3} ms | q2_0 scalar: {q_ms:.3} ms | {:.2}x",
+            dense_ms / q_ms
+        );
+        Ok(())
+    }
+
     /// The GGUF dtype id (42) round-trips through the registry.
     #[test]
     fn q2_0_dtype_id_roundtrips() {
