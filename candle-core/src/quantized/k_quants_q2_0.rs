@@ -11,7 +11,8 @@
 //! `ggml_vec_dot_q2_0_q8_0` kernels bit-for-bit so a Candle path can be checked
 //! against the same GGUF weights a `llama.cpp` build consumes.
 
-use super::k_quants::BlockQ8_0;
+use super::k_quants::{BlockQ8_0, GgmlType};
+use super::GgmlDType;
 use half::f16;
 
 /// Weights per `Q2_0` block.
@@ -28,15 +29,39 @@ pub struct BlockQ2_0 {
 
 const _: () = assert!(std::mem::size_of::<BlockQ2_0>() == 2 + QK2_0 / 4);
 
-impl BlockQ2_0 {
-    /// An all-zero block (scale 0, every code = 1 ⇒ weight 0).
-    pub fn zeros() -> Self {
-        Self {
-            d: f16::from_f32(0.0),
-            // code 1 maps to the signed value 0; a 0 scale also yields 0, but
-            // keeping codes at the zero point is the faithful empty block.
-            qs: [0b0101_0101; QK2_0 / 4],
+impl GgmlType for BlockQ2_0 {
+    const DTYPE: GgmlDType = GgmlDType::Q2_0;
+    const BLCK_SIZE: usize = QK2_0;
+    type VecDotType = BlockQ8_0;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        for (block, chunk) in xs.iter().zip(ys.chunks_exact_mut(QK2_0)) {
+            let d = block.d.to_f32();
+            for (e, out) in chunk.iter_mut().enumerate() {
+                let k = e / 32;
+                let within = e % 32;
+                let b = within / 4;
+                let pos = within % 4;
+                let code = (block.qs[k * 8 + b] >> (pos * 2)) & 0b11;
+                *out = (code as i32 - 1) as f32 * d;
+            }
         }
+    }
+
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        for (chunk, block) in xs.chunks_exact(QK2_0).zip(ys.iter_mut()) {
+            let mut arr = [0f32; QK2_0];
+            arr.copy_from_slice(chunk);
+            *block = quantize_block_q2_0(&arr);
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        vec_dot_q2_0_q8_0(n, xs, ys)
     }
 }
 
@@ -155,11 +180,44 @@ mod tests {
         // budget against the magnitude of the summed terms — not the dense
         // result, which can be small through cancellation and would make a
         // relative tolerance meaningless.
-        let abs_terms: f32 = weights.iter().zip(acts.iter()).map(|(w, a)| (w * a).abs()).sum();
+        let abs_terms: f32 = weights
+            .iter()
+            .zip(acts.iter())
+            .map(|(w, a)| (w * a).abs())
+            .sum();
         let tol = 0.03 * abs_terms;
         assert!(
             (got - dense).abs() < tol,
             "q2_0 dot {got} diverged from dense {dense} (tol {tol})"
+        );
+    }
+
+    /// The `GgmlType` slice methods (`from_float` / `to_float`) round-trip
+    /// multi-block ternary weights through the registered quantized type.
+    #[test]
+    fn q2_0_ggml_type_roundtrip() {
+        let scale = 0.9f32;
+        let weights: Vec<f32> = (0..QK2_0 * 2)
+            .map(|e| (((e * 3 + 2) % 3) as i32 - 1) as f32 * scale)
+            .collect();
+        let mut blocks = vec![BlockQ2_0::zeros(); 2];
+        BlockQ2_0::from_float(&weights, &mut blocks);
+        let mut back = vec![0f32; QK2_0 * 2];
+        BlockQ2_0::to_float(&blocks, &mut back);
+        for (e, (&w, &b)) in weights.iter().zip(back.iter()).enumerate() {
+            assert!((b - w).abs() < 1e-2 * scale, "elem {e}: {b} != {w}");
+        }
+    }
+
+    /// The GGUF dtype id (42) round-trips through the registry.
+    #[test]
+    fn q2_0_dtype_id_roundtrips() {
+        assert_eq!(GgmlDType::Q2_0.to_u32(), 42);
+        assert_eq!(GgmlDType::from_u32(42).unwrap(), GgmlDType::Q2_0);
+        assert_eq!(GgmlDType::Q2_0.block_size(), QK2_0);
+        assert_eq!(
+            GgmlDType::Q2_0.type_size(),
+            std::mem::size_of::<BlockQ2_0>()
         );
     }
 
