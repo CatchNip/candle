@@ -106,9 +106,22 @@ pub fn quantize_block_q2_0(weights: &[f32; QK2_0]) -> BlockQ2_0 {
 ///
 /// `n` is the shared dimension (a multiple of [`QK2_0`]). Each `Q2_0` block
 /// pairs with four `Q8_0` blocks (4 × 32 = 128 activations). Mirrors the
-/// reference `ggml_vec_dot_q2_0_q8_0` accumulation order.
+/// reference `ggml_vec_dot_q2_0_q8_0` accumulation order. Dispatches to a NEON
+/// implementation on aarch64 (bit-identical integer accumulation) and the
+/// scalar reference everywhere else.
 pub fn vec_dot_q2_0_q8_0(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
     debug_assert_eq!(n % QK2_0, 0, "n must be a multiple of {QK2_0}");
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is mandatory on aarch64; every load stays within the block
+    // slices, whose lengths are fixed by the `Q2_0` / `Q8_0` layouts.
+    let out = unsafe { vec_dot_q2_0_q8_0_neon(n, xs, ys) };
+    #[cfg(not(target_arch = "aarch64"))]
+    let out = vec_dot_q2_0_q8_0_scalar(n, xs, ys);
+    out
+}
+
+/// Scalar reference dot — the correctness oracle for the NEON path.
+fn vec_dot_q2_0_q8_0_scalar(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
     let nb = n / QK2_0;
 
     let mut sumf = 0.0f32;
@@ -128,6 +141,62 @@ pub fn vec_dot_q2_0_q8_0(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
                 sumi_block += (((byte >> 4) & 0b11) as i32 - 1) * qy[b * 4 + 2] as i32;
                 sumi_block += (((byte >> 6) & 0b11) as i32 - 1) * qy[b * 4 + 3] as i32;
             }
+            sumi += d1 * sumi_block as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+/// NEON dot for `Q2_0` × `Q8_0`. Unpacks each byte's four 2-bit codes into the
+/// element order the scalar path uses (`vst4` interleave), maps to ternary
+/// (`code - 1`), and accumulates `int8 × int8 → int16 → int32` per 32-element
+/// sub-block. The integer accumulation is identical to the scalar reference.
+///
+/// # Safety
+/// Requires NEON (mandatory on aarch64). All pointer reads stay within the
+/// fixed-size `Q2_0` / `Q8_0` block slices.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vec_dot_q2_0_q8_0_neon(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let nb = n / QK2_0;
+    let mut sumf = 0.0f32;
+    for i in 0..nb {
+        let d0 = xs[i].d.to_f32();
+        let mut sumi = 0.0f32;
+        for k in 0..4 {
+            let yb = &ys[i * 4 + k];
+            let d1 = yb.d.to_f32();
+            let codes = &xs[i].qs[k * 8..k * 8 + 8];
+            let qy = &yb.qs;
+
+            // Unpack 8 code bytes -> 32 ternary codes in element order.
+            let bvec = vld1_u8(codes.as_ptr());
+            let m3 = vdup_n_u8(0b11);
+            let c0 = vand_u8(bvec, m3);
+            let c1 = vand_u8(vshr_n_u8::<2>(bvec), m3);
+            let c2 = vand_u8(vshr_n_u8::<4>(bvec), m3);
+            let c3 = vand_u8(vshr_n_u8::<6>(bvec), m3);
+            let mut tmp = [0u8; 32];
+            vst4_u8(tmp.as_mut_ptr(), uint8x8x4_t(c0, c1, c2, c3));
+
+            let one = vdupq_n_s8(1);
+            let t_lo = vsubq_s8(vreinterpretq_s8_u8(vld1q_u8(tmp.as_ptr())), one);
+            let t_hi = vsubq_s8(vreinterpretq_s8_u8(vld1q_u8(tmp.as_ptr().add(16))), one);
+            let q_lo = vld1q_s8(qy.as_ptr());
+            let q_hi = vld1q_s8(qy.as_ptr().add(16));
+
+            // int8 × int8 -> int16 over four 8-lane halves, lane-summed (each
+            // partial ≤ 127, so int16 never overflows), then widened to int32.
+            let p0 = vmull_s8(vget_low_s8(t_lo), vget_low_s8(q_lo));
+            let p1 = vmull_s8(vget_high_s8(t_lo), vget_high_s8(q_lo));
+            let p2 = vmull_s8(vget_low_s8(t_hi), vget_low_s8(q_hi));
+            let p3 = vmull_s8(vget_high_s8(t_hi), vget_high_s8(q_hi));
+            let s = vaddq_s16(vaddq_s16(p0, p1), vaddq_s16(p2, p3));
+            let sumi_block = vaddvq_s32(vpaddlq_s16(s));
+
             sumi += d1 * sumi_block as f32;
         }
         sumf += d0 * sumi;
@@ -393,10 +462,40 @@ mod tests {
         let q_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
         eprintln!(
-            "[q2_0 matmul {out}x{k}] dense f32: {dense_ms:.3} ms | q2_0 scalar: {q_ms:.3} ms | {:.2}x",
+            "[q2_0 matmul {out}x{k}] dense f32: {dense_ms:.3} ms | q2_0: {q_ms:.3} ms | {:.2}x",
             dense_ms / q_ms
         );
         Ok(())
+    }
+
+    /// The NEON dot must be bit-identical to the scalar reference: both perform
+    /// the same integer accumulation, so the f32 results match exactly.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn q2_0_neon_matches_scalar() {
+        let nblk = 3;
+        let n = QK2_0 * nblk;
+        let mut xs = vec![BlockQ2_0::zeros(); nblk];
+        for (bi, x) in xs.iter_mut().enumerate() {
+            let mut w = [0f32; QK2_0];
+            for (e, wi) in w.iter_mut().enumerate() {
+                *wi = (((bi * 7 + e * 5 + 1) % 3) as i32 - 1) as f32 * 0.4;
+            }
+            *x = quantize_block_q2_0(&w);
+        }
+        let mut ys = vec![BlockQ8_0::zeros(); nblk * 4];
+        let acts: Vec<f32> = (0..n)
+            .map(|e| ((e as f32) * 0.09).sin() * (1.0 + (e % 7) as f32))
+            .collect();
+        BlockQ8_0::from_float(&acts, &mut ys);
+
+        let scalar = vec_dot_q2_0_q8_0_scalar(n, &xs, &ys);
+        let neon = unsafe { vec_dot_q2_0_q8_0_neon(n, &xs, &ys) };
+        assert_eq!(
+            scalar.to_bits(),
+            neon.to_bits(),
+            "neon {neon} != scalar {scalar}"
+        );
     }
 
     /// The GGUF dtype id (42) round-trips through the registry.
