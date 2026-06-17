@@ -126,6 +126,47 @@ pub fn vec_dot_q2_0_q8_0(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
     sumf
 }
 
+/// Quantised matmul for `Q2_0` weights: `dst[m,n] = lhs[m,k] · rhs_tᵀ`.
+///
+/// `rhs_t` holds `n` rows of `k/128` [`BlockQ2_0`] blocks (the weight matrix
+/// stored transposed, one block-row per output column). The generic
+/// [`super::k_quants::matmul`] cannot serve `Q2_0` because it assumes the
+/// weight and activation block sizes are equal; here the activations are
+/// quantised to `Q8_0` (`k/32` blocks per row) and each output element is a
+/// [`vec_dot_q2_0_q8_0`], which already bridges the 128-vs-32 ratio.
+pub fn matmul_q2_0(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs_t: &[BlockQ2_0],
+    dst: &mut [f32],
+) -> crate::Result<()> {
+    if k % QK2_0 != 0 {
+        crate::bail!("Q2_0 matmul requires k ({k}) to be a multiple of {QK2_0}");
+    }
+    if m * k != lhs.len() {
+        crate::bail!("unexpected lhs length {} for ({m},{k},{n})", lhs.len());
+    }
+    let k_q8 = k / 32; // Q8_0 activation blocks per row
+    let k_q2 = k / QK2_0; // Q2_0 weight blocks per row
+
+    let mut lhs_q8 = vec![BlockQ8_0::zeros(); m * k_q8];
+    for row in 0..m {
+        let src = &lhs[row * k..(row + 1) * k];
+        let dst_blocks = &mut lhs_q8[row * k_q8..(row + 1) * k_q8];
+        BlockQ8_0::from_float(src, dst_blocks);
+    }
+
+    for row in 0..m {
+        let act = &lhs_q8[row * k_q8..(row + 1) * k_q8];
+        let out = &mut dst[row * n..(row + 1) * n];
+        for (col, o) in out.iter_mut().enumerate() {
+            let w = &rhs_t[col * k_q2..(col + 1) * k_q2];
+            *o = vec_dot_q2_0_q8_0(k, w, act);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +247,57 @@ mod tests {
         BlockQ2_0::to_float(&blocks, &mut back);
         for (e, (&w, &b)) in weights.iter().zip(back.iter()).enumerate() {
             assert!((b - w).abs() < 1e-2 * scale, "elem {e}: {b} != {w}");
+        }
+    }
+
+    /// The dedicated `Q2_0` matmul agrees with a dense f32 matmul over the
+    /// same ternary weights — proving the 128-vs-32 block-ratio handling is
+    /// correct end to end (this is the path a quantized linear takes).
+    #[test]
+    fn q2_0_matmul_matches_dense() {
+        let (m, k, n) = (2usize, 256usize, 3usize);
+        let scale = 0.5f32;
+
+        // Transposed weights: n rows × k ternary values.
+        let mut w = vec![0f32; n * k];
+        for c in 0..n {
+            for i in 0..k {
+                w[c * k + i] = (((c * 31 + i * 7 + 1) % 3) as i32 - 1) as f32 * scale;
+            }
+        }
+        // Activations m × k.
+        let mut lhs = vec![0f32; m * k];
+        for r in 0..m {
+            for i in 0..k {
+                lhs[r * k + i] = (((r * 13 + i) as f32) * 0.07).sin() * (1.0 + (i % 4) as f32);
+            }
+        }
+
+        // Pack weights into Q2_0 (k/128 blocks per output row).
+        let kb = k / QK2_0;
+        let mut rhs_t = vec![BlockQ2_0::zeros(); n * kb];
+        for c in 0..n {
+            for blk in 0..kb {
+                let mut chunk = [0f32; QK2_0];
+                chunk.copy_from_slice(&w[c * k + blk * QK2_0..c * k + (blk + 1) * QK2_0]);
+                rhs_t[c * kb + blk] = quantize_block_q2_0(&chunk);
+            }
+        }
+
+        let mut got = vec![0f32; m * n];
+        matmul_q2_0((m, k, n), &lhs, &rhs_t, &mut got).unwrap();
+
+        for r in 0..m {
+            for c in 0..n {
+                let dense: f32 = (0..k).map(|i| lhs[r * k + i] * w[c * k + i]).sum();
+                let abs_terms: f32 = (0..k).map(|i| (lhs[r * k + i] * w[c * k + i]).abs()).sum();
+                let g = got[r * n + c];
+                let tol = 0.03 * abs_terms.max(1e-3);
+                assert!(
+                    (g - dense).abs() < tol,
+                    "[{r}][{c}] {g} != {dense} (tol {tol})"
+                );
+            }
         }
     }
 
