@@ -13,6 +13,7 @@
 use super::k_quants::{BlockQ8_0, GgmlType};
 use super::GgmlDType;
 use half::f16;
+use rayon::prelude::*;
 
 /// Weights per `Q1_0_g128` block.
 pub const QK1_0_G128: usize = 128;
@@ -161,10 +162,12 @@ pub fn matmul_q1_0_g128(
     for row in 0..m {
         let act = &lhs_q8[row * k_q8..(row + 1) * k_q8];
         let out = &mut dst[row * n..(row + 1) * n];
-        for (col, o) in out.iter_mut().enumerate() {
+        // Parallelise across output columns, matching the generic quantized
+        // matmul; each `o` is a disjoint output element.
+        out.par_iter_mut().enumerate().for_each(|(col, o)| {
             let w = &rhs_t[col * k_q1..(col + 1) * k_q1];
             *o = vec_dot_q1_0_g128_q8_0(k, w, act);
-        }
+        });
     }
     Ok(())
 }

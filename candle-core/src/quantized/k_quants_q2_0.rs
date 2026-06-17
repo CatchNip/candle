@@ -14,6 +14,7 @@
 use super::k_quants::{BlockQ8_0, GgmlType};
 use super::GgmlDType;
 use half::f16;
+use rayon::prelude::*;
 
 /// Weights per `Q2_0` block.
 pub const QK2_0: usize = 128;
@@ -120,7 +121,10 @@ pub fn vec_dot_q2_0_q8_0(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
     out
 }
 
-/// Scalar reference dot — the correctness oracle for the NEON path.
+/// Scalar reference dot — the correctness oracle for the NEON path. Compiled
+/// where it is reachable: the non-aarch64 fallback and the aarch64 equivalence
+/// test (the aarch64 runtime path is the NEON one).
+#[cfg(any(not(target_arch = "aarch64"), test))]
 fn vec_dot_q2_0_q8_0_scalar(n: usize, xs: &[BlockQ2_0], ys: &[BlockQ8_0]) -> f32 {
     let nb = n / QK2_0;
 
@@ -237,10 +241,12 @@ pub fn matmul_q2_0(
     for row in 0..m {
         let act = &lhs_q8[row * k_q8..(row + 1) * k_q8];
         let out = &mut dst[row * n..(row + 1) * n];
-        for (col, o) in out.iter_mut().enumerate() {
+        // Parallelise across output columns, matching the generic quantized
+        // matmul; each `o` is a disjoint output element.
+        out.par_iter_mut().enumerate().for_each(|(col, o)| {
             let w = &rhs_t[col * k_q2..(col + 1) * k_q2];
             *o = vec_dot_q2_0_q8_0(k, w, act);
-        }
+        });
     }
     Ok(())
 }
