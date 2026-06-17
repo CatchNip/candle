@@ -1041,6 +1041,10 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         // accuracy test does not apply. Its correctness is covered by the
         // dedicated tests in the quantized::k_quants_q2_0 module.
         GgmlDType::Q2_0 => bail!("Q2_0 is ternary; covered by the dedicated q2_0 tests"),
+
+        // Q1_0_g128 is bipolar 1-bit; the generic random-data accuracy test
+        // does not apply. Covered by the dedicated k_quants_q1_0_g128 tests.
+        GgmlDType::Q1_0_g128 => bail!("Q1_0_g128 is 1-bit; covered by its dedicated tests"),
     };
     Ok(err)
 }
