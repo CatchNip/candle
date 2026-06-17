@@ -63,6 +63,15 @@ impl GgmlType for BlockQ2_0 {
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         vec_dot_q2_0_q8_0(n, xs, ys)
     }
+
+    fn matmul_t(
+        mkn: (usize, usize, usize),
+        lhs: &[f32],
+        rhs_t: &[Self],
+        dst: &mut [f32],
+    ) -> crate::Result<()> {
+        matmul_q2_0(mkn, lhs, rhs_t, dst)
+    }
 }
 
 /// Map a 128-element weight slice to one `Q2_0` block.
@@ -299,6 +308,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// End-to-end through the public quantized API: quantise a ternary weight
+    /// matrix to `Q2_0`, run `QMatMul::forward`, and compare to a dense matmul.
+    /// This exercises the full dispatch a quantized linear layer takes.
+    #[test]
+    fn q2_0_qmatmul_end_to_end() -> crate::Result<()> {
+        use crate::quantized::{GgmlDType, QMatMul, QTensor};
+        use crate::{Device, Module, Tensor};
+
+        let dev = Device::Cpu;
+        let (out, k, m) = (4usize, 256usize, 2usize);
+        let w: Vec<f32> = (0..out * k)
+            .map(|e| (((e * 7 + 1) % 3) as i32 - 1) as f32 * 0.5)
+            .collect();
+        let w_t = Tensor::from_vec(w.clone(), (out, k), &dev)?;
+        let qt = QTensor::quantize(&w_t, GgmlDType::Q2_0)?;
+        let qmm = QMatMul::from_qtensor(qt)?;
+
+        let x: Vec<f32> = (0..m * k).map(|e| ((e as f32) * 0.05).sin()).collect();
+        let xt = Tensor::from_vec(x.clone(), (m, k), &dev)?;
+
+        let got = qmm.forward(&xt)?.to_vec2::<f32>()?;
+        let dense = xt.matmul(&w_t.t()?)?.to_vec2::<f32>()?;
+
+        for r in 0..m {
+            for c in 0..out {
+                let abs_terms: f32 = (0..k).map(|i| (x[r * k + i] * w[c * k + i]).abs()).sum();
+                let tol = 0.05 * abs_terms.max(1e-3);
+                assert!(
+                    (got[r][c] - dense[r][c]).abs() < tol,
+                    "[{r}][{c}] {} vs dense {}",
+                    got[r][c],
+                    dense[r][c]
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The GGUF dtype id (42) round-trips through the registry.

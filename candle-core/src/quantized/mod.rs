@@ -448,7 +448,7 @@ pub trait QuantizedType: Send + Sync {
 
 impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
-        k_quants::matmul(mkn, lhs, self.as_slice(), dst)
+        T::matmul_t(mkn, lhs, self.as_slice(), dst)
     }
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
         k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)

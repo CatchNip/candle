@@ -52,6 +52,22 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
 
     /// Generic implementation of the dot product without simd optimizations.
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
+
+    /// Matmul of an `[m, k]` f32 activation against this quantized weight
+    /// matrix stored transposed (`[n, k/BLCK_SIZE]` blocks), writing `[m, n]`.
+    ///
+    /// The default uses the generic vec-dot matmul, which requires the weight
+    /// and `VecDotType` block sizes to match. Types whose block size differs
+    /// from their `VecDotType` (e.g. the ternary `Q2_0`, 128 vs 32) override
+    /// this with a bespoke kernel that bridges the ratio.
+    fn matmul_t(
+        mkn: (usize, usize, usize),
+        lhs: &[f32],
+        rhs_t: &[Self],
+        dst: &mut [f32],
+    ) -> crate::Result<()> {
+        matmul(mkn, lhs, rhs_t, dst)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

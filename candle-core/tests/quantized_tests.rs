@@ -1036,6 +1036,11 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+
+        // Q2_0 is ternary (weights in {-1, 0, +1}); the generic random-data
+        // accuracy test does not apply. Its correctness is covered by the
+        // dedicated tests in the quantized::k_quants_q2_0 module.
+        GgmlDType::Q2_0 => bail!("Q2_0 is ternary; covered by the dedicated q2_0 tests"),
     };
     Ok(err)
 }
